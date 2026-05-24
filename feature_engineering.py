@@ -23,8 +23,10 @@ MIN_GAMES_FOR_CHAMP = 10            # min games to trust champion-level averages
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _expanding_shift(series: pd.Series) -> pd.Series:
-    """Expanding mean shifted by 1 (excludes current game)."""
-    return series.expanding().mean().shift(1)
+    """Exponentially weighted mean shifted by 1 — recent games count more, older games decay.
+    Span=15 means the last ~15 games get the most weight, older games fade out gradually.
+    """
+    return series.ewm(span=15, min_periods=1).mean().shift(1)
 
 
 def _rolling_shift(series: pd.Series, window: int) -> pd.Series:
@@ -199,7 +201,154 @@ def add_patch_meta_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def add_side_features(df: pd.DataFrame) -> pd.DataFrame:
+def add_opponent_defensive_strength(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    How many kills/deaths does the OPPOSING TEAM give up per game, by position?
+    e.g. if the enemy top laner consistently gives up 4 kills/game, that's a
+    strong signal the player facing them will get more kills.
+
+    This is different from opponent player rolling stats — it's the team's
+    defensive weakness at each position.
+    """
+    df = df.sort_values(["teamname", "position", "date"]).copy()
+
+    # For each player, build "kills given up by their team at this position"
+    # = kills scored by the OPPONENT in that position against this team
+    # We compute: for each (gameid, teamname, position) → opp_position_kills_allowed
+
+    # Step 1: get opponent kills by position per game
+    opp_kills = df[["gameid", "side", "position", "kills", "deaths", "assists"]].copy()
+    opp_kills["opp_side"] = opp_kills["side"].map({"Blue": "Red", "Red": "Blue"})
+
+    # Rename to mark as "what the opponent scored at this position"
+    opp_scored = opp_kills.rename(columns={
+        "kills":   "opp_pos_kills_scored",
+        "deaths":  "opp_pos_deaths_scored",
+        "assists": "opp_pos_assists_scored",
+        "side":    "def_side",
+    })[["gameid", "opp_side", "position",
+        "opp_pos_kills_scored", "opp_pos_deaths_scored", "opp_pos_assists_scored"]]
+
+    # Merge back: for each player row, get what the opponent scored at same position
+    df = df.merge(
+        opp_scored.rename(columns={"opp_side": "side"}),
+        on=["gameid", "side", "position"], how="left"
+    )
+
+    # Step 2: rolling average of kills ALLOWED by this team at this position
+    # (how soft is this team defensively at each role?)
+    for stat, src_col in [
+        ("kills",   "opp_pos_kills_scored"),
+        ("deaths",  "opp_pos_deaths_scored"),
+        ("assists", "opp_pos_assists_scored"),
+    ]:
+        col_name = f"team_pos_{stat}_allowed_roll5"
+        df[col_name] = df.groupby(["teamname", "position"])[src_col].transform(
+            lambda s: _rolling_shift(s, 5)
+        )
+
+    # Step 3: Now flip perspective — for each player, get the OPPONENT team's
+    # defensive weakness at their position (how many kills do they give up there?)
+    weakness = df[["gameid", "side", "position",
+                   "team_pos_kills_allowed_roll5",
+                   "team_pos_deaths_allowed_roll5",
+                   "team_pos_assists_allowed_roll5"]].copy()
+    weakness["opp_side"] = weakness["side"].map({"Blue": "Red", "Red": "Blue"})
+    weakness = weakness.rename(columns={
+        "team_pos_kills_allowed_roll5":   "opp_team_kills_allowed_roll5",
+        "team_pos_deaths_allowed_roll5":  "opp_team_deaths_allowed_roll5",
+        "team_pos_assists_allowed_roll5": "opp_team_assists_allowed_roll5",
+    })
+
+    df = df.merge(
+        weakness[["gameid", "opp_side", "position",
+                  "opp_team_kills_allowed_roll5",
+                  "opp_team_deaths_allowed_roll5",
+                  "opp_team_assists_allowed_roll5"]].rename(
+            columns={"opp_side": "side"}
+        ),
+        on=["gameid", "side", "position"], how="left"
+    )
+
+    # Clean up temp cols
+    df.drop(columns=["opp_pos_kills_scored", "opp_pos_deaths_scored",
+                     "opp_pos_assists_scored"], inplace=True, errors="ignore")
+
+    return df
+
+
+def add_champion_patch_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Champion performance on the CURRENT patch vs their historical average.
+    Captures meta shifts: e.g. a buffed jungler suddenly getting more kills.
+
+    Features:
+      - champ_patch_kills_avg: avg kills for this champ+position on current patch
+      - champ_patch_kills_delta: difference from their all-time average
+        (positive = performing better on this patch than usual)
+    """
+    if "patch" not in df.columns:
+        return df
+
+    df = df.sort_values(["champion", "position", "patch", "date"]).copy()
+
+    for stat in TARGETS:
+        # Average for this champion+position on this specific patch (expanding, leak-free)
+        df[f"{stat}_champ_patch_avg"] = df.groupby(
+            ["champion", "position", "patch"]
+        )[stat].transform(_expanding_shift)
+
+        # Delta vs all-time champion average (already computed in add_champion_features)
+        all_time_col = f"{stat}_champ_avg"
+        if all_time_col in df.columns:
+            df[f"{stat}_champ_patch_delta"] = (
+                df[f"{stat}_champ_patch_avg"] - df[all_time_col]
+            )
+
+    # Position-level patch averages: is this patch good for junglers overall?
+    for stat in TARGETS:
+        df[f"{stat}_pos_patch_avg"] = df.groupby(
+            ["position", "patch"]
+        )[stat].transform(_expanding_shift)
+
+        # Delta vs position all-time average
+        pos_alltime = df.groupby("position")[stat].transform(_expanding_shift)
+        df[f"{stat}_pos_patch_delta"] = df[f"{stat}_pos_patch_avg"] - pos_alltime
+
+    return df
+
+
+def add_momentum_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Is the player trending up or down recently?
+    Momentum = short-term average minus long-term average.
+    Positive = hot streak, Negative = cold streak.
+    """
+    df = df.sort_values(["playername", "position", "date"]).copy()
+
+    for stat in TARGETS:
+        short = df.groupby(["playername", "position"])[stat].transform(
+            lambda s: _rolling_shift(s, 3)
+        )
+        long_ = df.groupby(["playername", "position"])[stat].transform(
+            lambda s: _rolling_shift(s, 10)
+        )
+        df[f"{stat}_momentum"] = short - long_
+
+    # Team momentum (winning streak direction)
+    if "result" in df.columns:
+        team_short = df.groupby("teamname")["result"].transform(
+            lambda s: _rolling_shift(s, 3)
+        )
+        team_long = df.groupby("teamname")["result"].transform(
+            lambda s: _rolling_shift(s, 10)
+        )
+        df["team_momentum"] = team_short - team_long
+
+    return df
+
+
+
     """
     Blue vs Red side has historically different kill distributions in some metas.
     """
@@ -227,12 +376,15 @@ def build_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
     Output: feature-rich dataframe ready for modelling
     """
     steps = [
-        ("Player rolling stats",     add_player_rolling_features),
-        ("Champion averages",         add_champion_features),
-        ("Team context",              add_team_context_features),
-        ("Opponent features",         add_opponent_features),
-        ("Side features",             add_side_features),
-        ("Position encoding",         add_position_encoding),
+        ("Player rolling stats",          add_player_rolling_features),
+        ("Champion averages",              add_champion_features),
+        ("Champion-patch interactions",    add_champion_patch_features),
+        ("Team context",                   add_team_context_features),
+        ("Opponent features",              add_opponent_features),
+        ("Opponent defensive strength",    add_opponent_defensive_strength),
+        ("Player momentum",               add_momentum_features),
+        ("Side features",                  add_side_features),
+        ("Position encoding",              add_position_encoding),
     ]
 
     for name, fn in steps:
