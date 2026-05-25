@@ -22,6 +22,13 @@ MIN_GAMES_FOR_CHAMP = 10            # min games to trust champion-level averages
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+def _winsorize(series: pd.Series, pct: float = 0.95) -> pd.Series:
+    """Cap values at the rolling pct percentile to reduce outlier impact.
+    Uses an expanding window so we never look ahead."""
+    cap = series.expanding().quantile(pct).shift(1)
+    return series.clip(upper=cap)
+
+
 def _expanding_shift(series: pd.Series) -> pd.Series:
     """Exponentially weighted mean shifted by 1 — recent games count more, older games decay.
     Span=15 means the last ~15 games get the most weight, older games fade out gradually.
@@ -43,15 +50,24 @@ def add_player_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     df = df.sort_values(["playername", "date", "gameid"]).copy()
 
+    # Winsorize K/D/A per player to cap outlier blowout games
+    # e.g. a 13-kill game gets capped at ~95th percentile of that player's history
     for stat in TARGETS:
-        grp = df.groupby(["playername", "position"])[stat]
-        # Expanding (career average up to that point)
+        df[f"_{stat}_w"] = df.groupby(["playername", "position"])[stat].transform(_winsorize)
+
+    for stat in TARGETS:
+        wcol = f"_{stat}_w"
+        grp  = df.groupby(["playername", "position"])[wcol]
+        # Expanding EWM average (winsorized)
         df[f"{stat}_player_career_avg"] = grp.transform(_expanding_shift)
-        # Rolling windows
+        # Rolling windows (winsorized)
         for w in ROLLING_WINDOWS:
             df[f"{stat}_player_roll{w}"] = grp.transform(
                 lambda s, w=w: _rolling_shift(s, w)
             )
+
+    # Clean up winsorized temp cols
+    df.drop(columns=[f"_{s}_w" for s in TARGETS], inplace=True)
 
     # Rolling KDA ratio (kills+assists) / max(deaths,1)
     def kda_ratio(sub):
@@ -60,8 +76,8 @@ def add_player_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
         a = sub["assists"].shift(1)
         return (k + a) / d
 
-    # Precompute then roll
-    df["_kda"] = (df["kills"] + df["assists"]) / df["deaths"].clip(lower=1)
+    # Precompute winsorized KDA then roll
+    df["_kda"] = (df["kills"].clip(upper=df.groupby(["playername","position"])["kills"].transform(lambda s: s.expanding().quantile(0.95).shift(1))) + df["assists"]) / df["deaths"].clip(lower=1)
     for w in [5, 10]:
         df[f"player_kda_roll{w}"] = df.groupby(["playername", "position"])["_kda"].transform(
             lambda s, w=w: _rolling_shift(s, w)
