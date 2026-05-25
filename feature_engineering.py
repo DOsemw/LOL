@@ -22,10 +22,25 @@ MIN_GAMES_FOR_CHAMP = 10            # min games to trust champion-level averages
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def _winsorize(series: pd.Series, pct: float = 0.95) -> pd.Series:
-    """Cap values at the rolling pct percentile to reduce outlier impact.
-    Uses an expanding window so we never look ahead."""
-    cap = series.expanding().quantile(pct).shift(1)
+def _winsorize(series: pd.Series) -> pd.Series:
+    """
+    Cap outlier values to reduce blowout game impact.
+    Uses adaptive percentile based on sample size:
+      - <20 games: cap at 85th percentile (more aggressive)
+      - 20-40 games: cap at 90th percentile
+      - 40+ games: cap at 93rd percentile
+    All caps use expanding window so we never look ahead.
+    """
+    n = series.expanding().count().shift(1)
+    pct = np.where(n < 20, 0.85, np.where(n < 40, 0.90, 0.93))
+    # Compute expanding quantiles at each threshold
+    cap_85 = series.expanding().quantile(0.85).shift(1)
+    cap_90 = series.expanding().quantile(0.90).shift(1)
+    cap_93 = series.expanding().quantile(0.93).shift(1)
+    cap = pd.Series(
+        np.where(n < 20, cap_85, np.where(n < 40, cap_90, cap_93)),
+        index=series.index
+    )
     return series.clip(upper=cap)
 
 
@@ -93,6 +108,31 @@ def add_player_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # Games played (experience proxy)
     df["player_games_played"] = df.groupby(["playername", "position"]).cumcount()
+
+    # Win/loss split rolling averages
+    # Kills when winning vs losing are very different — this is key for moneyline adjustment
+    if "result" in df.columns:
+        for stat in TARGETS:
+            # Re-winsorize for split rolls
+            w_vals = df.groupby(["playername", "position"])[stat].transform(_winsorize)
+            for result_val, suffix in [(1, "win"), (0, "loss")]:
+                masked = w_vals.where(df["result"] == result_val)
+                df[f"{stat}_player_roll10_{suffix}"] = (
+                    df.groupby(["playername", "position"])[stat]
+                    .transform(lambda s, rv=result_val: (
+                        s.where(df.loc[s.index, "result"] == rv)
+                         .rolling(10, min_periods=1).mean()
+                         .shift(1)
+                    ))
+                )
+
+        # Per-player win rate rolling
+        df["player_winrate_roll10"] = df.groupby(["playername", "position"])["result"].transform(
+            lambda s: _rolling_shift(s, 10)
+        )
+        df["player_winrate_roll5"] = df.groupby(["playername", "position"])["result"].transform(
+            lambda s: _rolling_shift(s, 5)
+        )
 
     return df
 
