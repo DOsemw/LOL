@@ -361,6 +361,17 @@ def add_momentum_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_side_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Blue vs Red side has historically different kill distributions in some metas."""
+    df["is_blue_side"] = (df["side"] == "Blue").astype(int)
+
+    for stat in TARGETS:
+        side_avg = df.groupby(["position", "side"])[stat].transform(_expanding_shift)
+        df[f"{stat}_side_pos_avg"] = side_avg
+
+    return df
+
+
 def add_position_encoding(df: pd.DataFrame) -> pd.DataFrame:
     """One-hot encode position (top/jng/mid/bot/sup)."""
     pos_dummies = pd.get_dummies(df["position"], prefix="pos")
