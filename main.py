@@ -199,6 +199,26 @@ def predict_player(
     else:
         win_prob = 0.5
 
+    # ── Win/loss feature blending ──────────────────────────────────────────────
+    # Blend win-game stats and loss-game stats based on win probability.
+    # If team is 75% favourite, features = 75% from "when winning" + 25% from "when losing"
+    # This directly fixes the problem of recent losses dragging down a favourite's projection.
+    for stat in ["kills", "deaths", "assists"]:
+        win_col  = f"{stat}_player_roll10_win"
+        loss_col = f"{stat}_player_roll10_loss"
+        base_col = f"{stat}_player_roll10"
+        if win_col in X.columns and loss_col in X.columns:
+            win_val  = X[win_col].fillna(X.get(base_col, X[win_col])).values[0]
+            loss_val = X[loss_col].fillna(X.get(base_col, X[loss_col])).values[0]
+            # Weighted blend
+            blended = win_prob * win_val + (1 - win_prob) * loss_val
+            if base_col in X.columns:
+                X[base_col] = blended
+            # Also update career avg
+            career_col = f"{stat}_player_career_avg"
+            if career_col in X.columns:
+                X[career_col] = blended
+
     # ── Opponent defensive adjustment ──────────────────────────────────────────
     # Override opponent defensive strength features with the actual upcoming opponent
     opp_adj = {}
