@@ -80,15 +80,21 @@ def add_player_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
     # Win/loss split rolling stats — KEY for moneyline-aware predictions
     if "result" in df.columns:
         for stat in TARGETS:
-            wcol = f"_{stat}_w"
+            wcol = f"_{stat}_w" if f"_{stat}_w" in df.columns else stat
             for result_val, suffix in [(1, "win"), (0, "loss")]:
-                def _split_roll(g, wcol=wcol, rv=result_val):
-                    masked = g[wcol].where(g["result"] == rv)
-                    return masked.rolling(10, min_periods=1).mean().shift(1)
-
-                df[f"{stat}_player_roll10_{suffix}"] = df.groupby(
-                    ["playername", "position"], group_keys=False
-                ).apply(_split_roll).reset_index(level=[0,1], drop=True)
+                col_name = f"{stat}_player_roll10_{suffix}"
+                result_col = df["result"].copy()
+                vals = df[wcol].where(result_col == result_val)
+                df[col_name] = df.groupby(
+                    ["playername", "position"]
+                )[wcol].transform(
+                    lambda s, rv=result_val, w=wcol: (
+                        df.loc[s.index, w]
+                        .where(df.loc[s.index, "result"] == rv)
+                        .rolling(10, min_periods=1).mean()
+                        .shift(1)
+                    )
+                )
 
         # Per-player win rate
         for w in [5, 10]:
