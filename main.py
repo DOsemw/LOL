@@ -43,10 +43,17 @@ def load_everything():
     else:
         log.info("Loaded existing models from disk.")
 
+    # Compute win/loss calibration ratios from data
+    from calibration import compute_win_loss_ratios, save_calibration
+    ratios = compute_win_loss_ratios(raw)
+    save_calibration(ratios)
+    log.info(f"Calibration computed for {len(ratios)} positions")
+
     STATE.update({
         "df": feat, "feature_cols": fcols, "ready": True,
         "n_players": feat["playername"].nunique(),
         "date_range": f"{feat['date'].min().date()} → {feat['date'].max().date()}",
+        "calibration": ratios,
     })
     log.info(f"Ready — {STATE['n_players']} players, {STATE['date_range']}")
 
@@ -297,30 +304,41 @@ def predict_player(
     else:
         win_prob = 0.5
 
-    # 1. Blend win/loss features based on win probability
-    X = _apply_win_prob_blend(X, win_prob, df, player_df)
-
-    # 2. Apply opponent defensive adjustment
+    # 1. Apply opponent defensive adjustment to features
     opp_info = {}
     if opponent:
         X, opp_info = _apply_opponent_adjustment(X, opponent, position, df)
 
-    # 3. Get base per-game predictions
+    # 2. Get base per-game predictions from model
     pg = {}
     for stat in ["kills","deaths","assists"]:
         model, _, metrics = load_model(stat)
         pg[stat] = _predict_stat(model, X, metrics["mae"])
 
-    # 4. Apply opponent kill ratio adjustment to predictions
-    if opp_info:
-        kills_ratio  = opp_info.get("kills_ratio",  1.0)
-        deaths_ratio = opp_info.get("deaths_ratio", 1.0)
-        assists_ratio = (kills_ratio + 1.0) / 2.0
+    # 3. Scale predictions using data-driven win/loss calibration
+    # This replaces hand-crafted multipliers with empirical ratios from actual data
+    if win_prob != 0.5:
+        from calibration import scale_prediction, load_calibration
+        ratios = STATE.get("calibration") or load_calibration()
+        if ratios:
+            for stat in ["kills","deaths","assists"]:
+                scaled = scale_prediction(
+                    pg[stat]["per_game"], stat, position, win_prob, ratios
+                )
+                ratio = scaled / pg[stat]["per_game"] if pg[stat]["per_game"] > 0 else 1.0
+                ratio = min(max(ratio, 0.5), 2.0)
+                pg[stat]["per_game"] = round(pg[stat]["per_game"] * ratio, 2)
+                pg[stat]["low"]      = round(pg[stat]["low"]      * ratio, 2)
+                pg[stat]["high"]     = round(pg[stat]["high"]      * ratio, 2)
 
+    # 4. Apply opponent kill ratio adjustment
+    if opp_info:
+        kills_ratio   = min(max(opp_info.get("kills_ratio",  1.0), 0.6), 1.6)
+        deaths_ratio  = min(max(opp_info.get("deaths_ratio", 1.0), 0.6), 1.6)
+        assists_ratio = (kills_ratio + 1.0) / 2.0
         for stat, ratio in [("kills", kills_ratio),
                              ("deaths", deaths_ratio),
                              ("assists", assists_ratio)]:
-            ratio = min(max(ratio, 0.6), 1.6)
             pg[stat]["per_game"] = round(pg[stat]["per_game"] * ratio, 2)
             pg[stat]["low"]      = round(pg[stat]["low"]      * ratio, 2)
             pg[stat]["high"]     = round(pg[stat]["high"]     * ratio, 2)
