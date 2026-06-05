@@ -1,188 +1,269 @@
 """
-predict.py
-----------
-Inference layer: given a player name + upcoming match context,
-return expected kills / deaths / assists with confidence intervals.
+predict.py v2
+-------------
+Combines Model 1 (team kills) and Model 2 (kill share) into final prediction.
 
-Usage:
-    python predict.py --player "Faker" --champion "Azir" --opponent "Chovy" --league "LCK"
+Flow:
+  1. Get player's recent kill share features
+  2. Get team's recent kill environment features
+  3. Apply win probability blend to kill share (win games vs loss games)
+  4. Predict team kills → predict kill share → multiply
+  5. Apply Bayesian shrinkage for low-sample players
+  6. Scale to M1-2 and M1-3 using series probability matrix
 """
 
-import argparse
 import numpy as np
 import pandas as pd
-from model import load_model, TARGETS
-from feature_engineering import build_features, get_feature_columns
-from data_ingestion import load_raw, filter_major_leagues
+from series import scale_to_series, fantasy_score
 
 
-# ── Confidence intervals via quantile estimation ──────────────────────────────
+# Kill share limits per position (realistic bounds)
+KILL_SHARE_LIMITS = {
+    "top": (0.05, 0.50),
+    "jng": (0.05, 0.50),
+    "mid": (0.08, 0.55),
+    "bot": (0.08, 0.60),
+    "sup": (0.01, 0.25),
+}
 
-def bootstrap_ci(model, X_row: pd.DataFrame, n_boot: int = 200, ci: float = 0.9) -> tuple:
+# Deaths and assists share limits
+DEATH_SHARE_LIMITS = {
+    "top": (0.10, 0.40),
+    "jng": (0.08, 0.35),
+    "mid": (0.10, 0.35),
+    "bot": (0.08, 0.35),
+    "sup": (0.10, 0.40),
+}
+
+
+def _get_player_row(df: pd.DataFrame, player: str, feature_cols: list) -> tuple:
+    """Get most recent feature row for a player."""
+    mask = df["playername"].str.lower() == player.strip().lower()
+    if not mask.any():
+        suggestions = [p for p in df["playername"].unique()
+                       if player.lower() in p.lower()][:6]
+        raise ValueError(f"Player '{player}' not found. Suggestions: {suggestions}")
+    player_df = df[mask].sort_values("date", ascending=False)
+    X = player_df.iloc[[0]][feature_cols].copy()
+    return player_df, X
+
+
+def _apply_win_prob_blend(X: pd.DataFrame, win_prob: float) -> pd.DataFrame:
     """
-    Estimate prediction uncertainty by perturbing features slightly.
-    Returns (low, mid, high) at the given confidence interval.
-    Quick proxy — proper uncertainty requires quantile regression or conformal prediction.
+    Blend win/loss kill share based on win probability.
+    At 70% win prob: features = 70% from winning games + 30% from losing games.
     """
-    base_pred = float(model.predict(X_row)[0])
-    noise_scale = 0.05  # 5% feature noise
+    X = X.copy()
+    win_col  = "kill_share_roll10_win"
+    loss_col = "kill_share_roll10_loss"
+    base_col = "kill_share_player_ewm"
 
-    preds = []
-    for _ in range(n_boot):
-        noisy = X_row.copy()
-        for col in noisy.select_dtypes(include=[np.number]).columns:
-            noisy[col] += np.random.normal(0, abs(noisy[col].values[0]) * noise_scale + 0.01)
-        preds.append(float(model.predict(noisy)[0]))
+    if win_col in X.columns and loss_col in X.columns:
+        win_val  = float(X[win_col].fillna(X.get(base_col, pd.Series([np.nan])).iloc[0]).iloc[0])
+        loss_val = float(X[loss_col].fillna(X.get(base_col, pd.Series([np.nan])).iloc[0]).iloc[0])
 
-    alpha = (1 - ci) / 2
-    low  = max(0, np.quantile(preds, alpha))
-    high = np.quantile(preds, 1 - alpha)
-    return round(low, 2), round(base_pred, 2), round(high, 2)
+        if np.isnan(win_val):  win_val  = float(X[base_col].iloc[0]) if base_col in X.columns else 0.2
+        if np.isnan(loss_val): loss_val = float(X[base_col].iloc[0]) if base_col in X.columns else 0.2
+
+        blended = win_prob * win_val + (1 - win_prob) * loss_val
+        if base_col in X.columns:
+            X[base_col] = blended
+
+    # Update win rate features to reflect actual expected win prob
+    for col in ["player_winrate", "team_winrate"]:
+        if col in X.columns:
+            X[col] = win_prob
+
+    return X
 
 
-# ── Lookup player's recent game rows ─────────────────────────────────────────
-
-def get_player_context(df: pd.DataFrame, player_name: str, n_recent: int = 5) -> pd.DataFrame:
+def _shrinkage_blend(player_pred: float, position: str, league: str,
+                     games_played: int, df: pd.DataFrame) -> float:
     """
-    Pull the most recent N games for a player to display form.
-    df must already have features built.
+    Bayesian shrinkage: blend player prediction toward league+position average.
+    Less data = more weight on league average.
     """
-    player_df = df[df["playername"].str.lower() == player_name.lower()].copy()
-    player_df = player_df.sort_values("date", ascending=False)
-    return player_df.head(n_recent)[["date", "champion", "kills", "deaths", "assists", "result"]]
+    if games_played >= 20:
+        return player_pred  # enough data, trust the model
 
+    player_weight = games_played / 20.0
 
-def get_player_feature_row(df: pd.DataFrame, player_name: str, feature_cols: list[str]) -> pd.DataFrame:
-    """
-    Get the most recent feature row for a player (represents their current form state).
-    This is what gets passed to the model for inference.
-    """
-    player_df = df[df["playername"].str.lower() == player_name.lower()].copy()
-    player_df = player_df.sort_values("date", ascending=False)
-    if len(player_df) == 0:
-        raise ValueError(f"Player '{player_name}' not found in dataset.")
+    # League+position average kill share
+    mask = (df["position"] == position) & (df["league"] == league)
+    if mask.sum() >= 10:
+        league_avg = float(df[mask]["kill_share"].mean())
+    else:
+        league_avg = float(df[df["position"] == position]["kill_share"].mean())
 
-    row = player_df.iloc[[0]][feature_cols].copy()
-    return row
+    return player_weight * player_pred + (1 - player_weight) * league_avg
 
-
-# ── Main prediction function ──────────────────────────────────────────────────
 
 def predict_player(
-    df: pd.DataFrame,
-    feature_cols: list[str],
-    player_name: str,
-    override_features: dict = None,
-    ci: float = 0.9,
-    verbose: bool = True,
+    df:            pd.DataFrame,
+    tk_model:      object,
+    tk_features:   list,
+    ks_models:     dict,
+    ks_features:   list,
+    player:        str,
+    win_prob:      float = 0.5,
+    opponent:      str   = None,
+    side:          str   = "Blue",
 ) -> dict:
     """
-    Predict expected K/D/A for a player in their next game.
+    Full prediction pipeline for one player.
 
-    Args:
-        df:               Feature-engineered dataframe
-        feature_cols:     List of feature column names
-        player_name:      Player name (must match OE data)
-        override_features: Dict of feature overrides (e.g., {"is_blue_side": 1})
-        ci:               Confidence interval width (default 90%)
-        verbose:          Print formatted output
-
-    Returns:
-        Dict with predictions for kills, deaths, assists
+    Returns dict with kills/deaths/assists for M1, M1-2, M1-3.
     """
-    # Get feature row from most recent game
-    X = get_player_feature_row(df, player_name, feature_cols)
+    from model_team_kills import predict as predict_team_kills
+    from model_kill_share import predict as predict_kill_share
 
-    # Apply any manual overrides (e.g., different champion, side)
-    if override_features:
-        for k, v in override_features.items():
-            if k in X.columns:
-                X[k] = v
+    # Get player data
+    player_df, X_player = _get_player_row(df, player, ks_features)
+    position    = player_df.iloc[0]["position"]
+    league      = player_df.iloc[0]["league"]
+    games_played = player_df["gameid"].nunique()
 
-    results = {}
-    for target in TARGETS:
-        model, _, metrics = load_model(target)
-        low, mid, high = bootstrap_ci(model, X, ci=ci)
-        results[target] = {"low": low, "mid": mid, "high": high, "mae": metrics["mae"]}
+    # Side encoding
+    if "is_blue_side" in X_player.columns:
+        X_player["is_blue_side"] = 1 if side.lower() == "blue" else 0
 
-    if verbose:
-        _print_prediction(player_name, results, ci, df)
+    # Win prob blend on kill share features
+    X_player = _apply_win_prob_blend(X_player, win_prob)
 
-    return results
+    # ── Model 1: Team Kills ──────────────────────────────────────────────
+    # Get team feature row
+    team_mask = (df["teamname"] == player_df.iloc[0]["teamname"])
+    team_df   = df[team_mask].drop_duplicates("gameid").sort_values("date", ascending=False)
 
+    # If opponent specified, override opponent features
+    if opponent:
+        opp_mask = df["teamname"].str.lower().str.contains(opponent.lower(), na=False)
+        opp_df   = df[opp_mask].drop_duplicates("gameid").sort_values("date", ascending=False)
+        if len(opp_df) >= 3:
+            opp_pos_df = opp_df[opp_df["position"] == position]
+            if len(opp_pos_df) >= 3 and "opp_death_rate_ewm" in team_df.columns:
+                opp_death_rate = float(opp_pos_df["deaths"].tail(10).mean())
+                team_df = team_df.copy()
+                team_df["opp_death_rate_ewm"] = opp_death_rate
 
-def _print_prediction(player_name: str, results: dict, ci: float, df: pd.DataFrame):
-    ci_pct = int(ci * 100)
-    print(f"\n{'='*55}")
-    print(f"  Player Props Prediction: {player_name}")
-    print(f"{'='*55}")
-    print(f"  {'Stat':<10} {'Expected':>10}  {'±MAE':>8}  {f'{ci_pct}% CI':>16}")
-    print(f"  {'-'*50}")
-    for stat, r in results.items():
-        mae = r["mae"]
-        ci_str = f"[{r['low']:.1f} – {r['high']:.1f}]"
-        print(f"  {stat.upper():<10} {r['mid']:>10.2f}  {f'±{mae:.2f}':>8}  {ci_str:>16}")
-    print(f"{'='*55}\n")
+    X_team = team_df.iloc[[0]][tk_features].copy() if len(team_df) > 0 else None
+
+    if X_team is not None and not X_team[tk_features].isnull().all().all():
+        if "is_blue_side" in X_team.columns:
+            X_team["is_blue_side"] = 1 if side.lower() == "blue" else 0
+        team_kills_pred = predict_team_kills(tk_model, X_team)
+    else:
+        # Fallback to league average team kills
+        team_kills_pred = float(df[df["league"] == league]["team_kills"].mean())
+        team_kills_pred = max(team_kills_pred, 5.0)
+
+    # ── Model 2: Kill Share ──────────────────────────────────────────────
+    if position not in ks_models:
+        # Fallback to position average
+        kill_share_pred = float(df[df["position"] == position]["kill_share"].mean())
+    else:
+        ks_model, _, ks_mae, pos_avg = ks_models[position]
+        kill_share_pred = predict_kill_share(ks_model, X_player, pos_avg)
+
+    # Bayesian shrinkage for low-sample players
+    kill_share_pred = _shrinkage_blend(
+        kill_share_pred, position, league, games_played, df
+    )
+
+    # Clamp to realistic bounds
+    lo, hi = KILL_SHARE_LIMITS.get(position, (0.05, 0.55))
+    kill_share_pred = float(np.clip(kill_share_pred, lo, hi))
+
+    # ── Combine: player kills = team kills × kill share ──────────────────
+    kills_per_map = team_kills_pred * kill_share_pred
+
+    # Deaths prediction (similar approach with death share)
+    # Use player's rolling death average scaled to team context
+    death_col = "deaths_player_ewm"
+    if death_col in X_player.columns and not pd.isna(X_player[death_col].iloc[0]):
+        raw_deaths = float(X_player[death_col].iloc[0])
+        if games_played < 20:
+            league_death_avg = float(df[
+                (df["position"] == position) & (df["league"] == league)
+            ]["deaths"].mean())
+            w = games_played / 20.0
+            raw_deaths = w * raw_deaths + (1 - w) * league_death_avg
+        deaths_per_map = max(0.3, raw_deaths)
+    else:
+        deaths_per_map = float(df[df["position"] == position]["deaths"].mean())
+
+    # Assists prediction (KP% × team kills - own kills)
+    kp_col = "kp_pct_player_ewm"
+    if kp_col in X_player.columns and not pd.isna(X_player[kp_col].iloc[0]):
+        kp = float(X_player[kp_col].iloc[0])
+        if games_played < 20:
+            league_kp_avg = float(df[
+                (df["position"] == position) & (df["league"] == league)
+            ]["kp_pct"].mean()) if "kp_pct" in df.columns else 0.5
+            w = games_played / 20.0
+            kp = w * kp + (1 - w) * league_kp_avg
+        assists_per_map = max(0.0, team_kills_pred * kp - kills_per_map)
+    else:
+        assists_per_map = float(df[df["position"] == position]["assists"].mean())
+
+    # MAE estimates from model
+    kills_mae  = float(ks_models[position][2]) * team_kills_pred if position in ks_models else 1.5
+    deaths_mae = 1.2
+    assists_mae = 2.0
+
+    # Confidence interval (±1 MAE)
+    def ci(val, mae):
+        return round(max(0, val - mae), 2), round(val + mae, 2)
+
+    k_low, k_high = ci(kills_per_map,  kills_mae)
+    d_low, d_high = ci(deaths_per_map, deaths_mae)
+    a_low, a_high = ci(assists_per_map, assists_mae)
+
+    # Scale to series
+    kills_series  = scale_to_series(kills_per_map,  k_low, k_high, kills_mae,  win_prob)
+    deaths_series = scale_to_series(deaths_per_map, d_low, d_high, deaths_mae, win_prob)
+    assists_series = scale_to_series(assists_per_map, a_low, a_high, assists_mae, win_prob)
 
     # Recent form
-    recent = df[df["playername"].str.lower() == player_name.lower()].sort_values(
-        "date", ascending=False
-    ).head(5)[["date", "champion", "kills", "deaths", "assists"]]
-    if len(recent) > 0:
-        print("  Recent form (last 5 games):")
-        print("  " + recent.to_string(index=False).replace("\n", "\n  "))
-        print()
+    recent = player_df.head(5)[["date","champion","kills","deaths","assists"]].copy()
+    recent["date"] = recent["date"].astype(str)
 
+    return {
+        "player":         player_df.iloc[0]["playername"],
+        "position":       position,
+        "league":         league,
+        "win_prob":       round(win_prob, 3),
+        "games_in_sample": games_played,
+        "team_kills_pred": round(team_kills_pred, 2),
+        "kill_share_pred": round(kill_share_pred, 3),
 
-# ── Batch prediction for a full lineup ───────────────────────────────────────
-
-def predict_lineup(
-    df: pd.DataFrame,
-    feature_cols: list[str],
-    players: list[str],
-) -> pd.DataFrame:
-    """Predict K/D/A for a list of players (e.g., a full team)."""
-    rows = []
-    for player in players:
-        try:
-            r = predict_player(df, feature_cols, player, verbose=False)
-            rows.append({
-                "player": player,
-                "kills_exp":   r["kills"]["mid"],
-                "deaths_exp":  r["deaths"]["mid"],
-                "assists_exp": r["assists"]["mid"],
-                "kills_ci":    f"[{r['kills']['low']:.1f}–{r['kills']['high']:.1f}]",
-                "deaths_ci":   f"[{r['deaths']['low']:.1f}–{r['deaths']['high']:.1f}]",
-                "assists_ci":  f"[{r['assists']['low']:.1f}–{r['assists']['high']:.1f}]",
-            })
-        except ValueError as e:
-            print(f"  [warn] {e}")
-    return pd.DataFrame(rows)
-
-
-# ── CLI ───────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Predict LoL player K/D/A props")
-    parser.add_argument("--player", required=True, help="Player name (OE format)")
-    parser.add_argument("--league", default=None, help="Filter to specific league")
-    parser.add_argument("--years", nargs="+", type=int, default=[2023, 2024])
-    parser.add_argument("--side", default=None, choices=["Blue", "Red"])
-    args = parser.parse_args()
-
-    print(f"\nLoading data ({args.years}) ...")
-    raw   = load_raw(years=args.years)
-    major = filter_major_leagues(raw)
-
-    if args.league:
-        major = major[major["league"] == args.league]
-
-    print("Building features ...")
-    feat  = build_features(major, verbose=False)
-    fcols = get_feature_columns(feat)
-
-    overrides = {}
-    if args.side:
-        overrides["is_blue_side"] = 1 if args.side == "Blue" else 0
-
-    predict_player(feat, fcols, args.player, override_features=overrides or None)
+        "map1": {
+            "kills":   kills_series["m1"],
+            "deaths":  deaths_series["m1"],
+            "assists": assists_series["m1"],
+        },
+        "m1_2": {
+            "kills":   kills_series["m1_2"],
+            "deaths":  deaths_series["m1_2"],
+            "assists": assists_series["m1_2"],
+            "fantasy": fantasy_score(
+                kills_series["m1_2"]["series_total"],
+                deaths_series["m1_2"]["series_total"],
+                assists_series["m1_2"]["series_total"],
+            ),
+            "expected_games": 2.0,
+        },
+        "m1_3": {
+            "kills":   kills_series["m1_3"],
+            "deaths":  deaths_series["m1_3"],
+            "assists": assists_series["m1_3"],
+            "fantasy": fantasy_score(
+                kills_series["m1_3"]["series_total"],
+                deaths_series["m1_3"]["series_total"],
+                assists_series["m1_3"]["series_total"],
+            ),
+            "expected_games": kills_series["m1_3"]["maps"],
+            "p_map3":         kills_series["m1_3"]["p_map3"],
+        },
+        "recent_form": recent.to_dict(orient="records"),
+    }
