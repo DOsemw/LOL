@@ -410,7 +410,7 @@ def predict_player(
         "m1_2": _build_series(pg, exp_bo2, win_prob),
         "m1_3": _build_series(pg, exp_bo3, win_prob),
 
-        "games_in_sample": int(mask.sum()),
+        "games_in_sample": games_played,
         "recent_form": recent.to_dict(orient="records"),
     }
 
