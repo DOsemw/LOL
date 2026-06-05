@@ -1,283 +1,228 @@
 """
-feature_engineering.py
------------------------
-Builds predictive features for player K/D/A from OE match data.
+feature_engineering.py v2
+--------------------------
+Builds features for two separate models:
+  1. Team kills model  — how many total kills will happen this game?
+  2. Kill share model  — what % of team kills does this player get?
 
-Key design principles:
-  - All features use ONLY information available BEFORE the match (no leakage)
-  - Win probability is baked in as a feature so the model learns it directly
-  - Outlier games are winsorized adaptively based on sample size
-  - Win/loss split rolling stats capture context-dependent performance
+Final prediction: team_kills × kill_share = player kills
+
+Key features per the blueprint:
+  - Kill Participation % (KP%) = (kills + assists) / team_kills
+  - Kill Share % = kills / team_kills
+  - Team Bloody Rate = (kills + deaths) / gamelength
+  - Avg Game Length
+  - Opponent Death Rate
+  - Post-15 Kill Share
+  - Win probability (from moneyline, as a feature)
 """
 
 import numpy as np
 import pandas as pd
 
-TARGETS = ["kills", "deaths", "assists"]
-ROLLING_WINDOWS = [3, 5, 10, 20]
+ROLLING = 10  # primary rolling window
+ROLLING_SHORT = 5
 
 
-# ── Core helpers ──────────────────────────────────────────────────────────────
-
-def _winsorize(series: pd.Series) -> pd.Series:
-    """
-    Cap outlier values adaptively based on sample size.
-    Fewer games = more aggressive capping to avoid single blowout games
-    dominating predictions.
-    """
-    n     = series.expanding().count().shift(1)
-    cap85 = series.expanding().quantile(0.85).shift(1)
-    cap90 = series.expanding().quantile(0.90).shift(1)
-    cap93 = series.expanding().quantile(0.93).shift(1)
-    cap   = pd.Series(
-        np.where(n < 20, cap85, np.where(n < 40, cap90, cap93)),
-        index=series.index
-    )
-    return series.clip(upper=cap)
-
-
-def _ewm_shift(series: pd.Series, span: int = 15) -> pd.Series:
-    """Exponentially weighted mean, shifted by 1 to avoid leakage."""
+def _shift_ewm(series: pd.Series, span: int = 10) -> pd.Series:
+    """EWM shifted by 1 to avoid leakage."""
     return series.ewm(span=span, min_periods=1).mean().shift(1)
 
 
-def _rolling_shift(series: pd.Series, window: int) -> pd.Series:
-    """Rolling mean over last N games, shifted by 1."""
+def _shift_roll(series: pd.Series, window: int) -> pd.Series:
+    """Rolling mean shifted by 1."""
     return series.rolling(window, min_periods=1).mean().shift(1)
 
 
-# ── Feature builders ──────────────────────────────────────────────────────────
-
-def add_player_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.sort_values(["playername", "date", "gameid"]).copy()
-
-    # Winsorize first
-    for stat in TARGETS:
-        df[f"_{stat}_w"] = df.groupby(["playername", "position"])[stat].transform(_winsorize)
-
-    for stat in TARGETS:
-        wcol = f"_{stat}_w"
-        grp  = df.groupby(["playername", "position"])[wcol]
-
-        # EWM career average
-        df[f"{stat}_player_career_avg"] = grp.transform(_ewm_shift)
-
-        # Rolling windows
-        for w in ROLLING_WINDOWS:
-            df[f"{stat}_player_roll{w}"] = grp.transform(
-                lambda s, w=w: _rolling_shift(s, w)
-            )
-
-    # KDA ratio
-    df["_kda"] = (
-        df["_kills_w"] + df["_assists_w"]
-    ) / df["deaths"].clip(lower=1)
-    for w in [5, 10]:
-        df[f"player_kda_roll{w}"] = df.groupby(
-            ["playername", "position"]
-        )["_kda"].transform(lambda s, w=w: _rolling_shift(s, w))
-
-    # Win/loss split rolling stats — KEY for moneyline-aware predictions
-    if "result" in df.columns:
-        for stat in TARGETS:
-            wcol = f"_{stat}_w" if f"_{stat}_w" in df.columns else stat
-            for result_val, suffix in [(1, "win"), (0, "loss")]:
-                col_name = f"{stat}_player_roll10_{suffix}"
-                result_col = df["result"].copy()
-                vals = df[wcol].where(result_col == result_val)
-                df[col_name] = df.groupby(
-                    ["playername", "position"]
-                )[wcol].transform(
-                    lambda s, rv=result_val, w=wcol: (
-                        df.loc[s.index, w]
-                        .where(df.loc[s.index, "result"] == rv)
-                        .rolling(10, min_periods=1).mean()
-                        .shift(1)
-                    )
-                )
-
-        # Per-player win rate
-        for w in [5, 10]:
-            df[f"player_winrate_roll{w}"] = df.groupby(
-                ["playername", "position"]
-            )["result"].transform(lambda s, w=w: _rolling_shift(s, w))
-
-    # Games played
-    df["player_games_played"] = df.groupby(["playername", "position"]).cumcount()
-
-    # Clean temp cols
-    df.drop(columns=[f"_{s}_w" for s in TARGETS] + ["_kda"],
-            inplace=True, errors="ignore")
-    return df
+def _winsorize(series: pd.Series, pct: float = 0.95) -> pd.Series:
+    """Cap at expanding percentile to handle outliers."""
+    cap = series.expanding().quantile(pct).shift(1)
+    return series.clip(upper=cap)
 
 
-def add_champion_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.sort_values(["champion", "position", "date"]).copy()
-    for stat in TARGETS:
-        df[f"{stat}_champ_avg"] = df.groupby(
-            ["champion", "position"]
-        )[stat].transform(_ewm_shift)
-    df["champ_kill_share"] = (
-        df["kills_champ_avg"] /
-        (df["kills_champ_avg"] + df["assists_champ_avg"] + 1)
-    )
-    df["champ_games"] = df.groupby("champion").cumcount()
-    return df
+# ── Step 1: compute per-game derived stats ─────────────────────────────────
 
+def add_derived_stats(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute kill share, KP%, bloody rate etc. per game row."""
+    df = df.copy()
 
-def add_champion_patch_features(df: pd.DataFrame) -> pd.DataFrame:
-    if "patch" not in df.columns:
-        return df
-    df = df.sort_values(["champion", "position", "patch", "date"]).copy()
-    for stat in TARGETS:
-        df[f"{stat}_champ_patch_avg"] = df.groupby(
-            ["champion", "position", "patch"]
-        )[stat].transform(_ewm_shift)
-        if f"{stat}_champ_avg" in df.columns:
-            df[f"{stat}_champ_patch_delta"] = (
-                df[f"{stat}_champ_patch_avg"] - df[f"{stat}_champ_avg"]
-            )
-    return df
-
-
-def add_team_context_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.sort_values(["teamname", "date", "gameid"]).copy()
-
+    # Team kills per game (sum all players on same team in same game)
     team_kills = df.groupby(["gameid", "teamname"])["kills"].transform("sum")
-    df["team_kills_pergame"] = team_kills
+    team_deaths = df.groupby(["gameid", "teamname"])["deaths"].transform("sum")
+    team_assists = df.groupby(["gameid", "teamname"])["assists"].transform("sum")
 
-    # Rolling team stats (deduplicated per game)
-    team_game = df.drop_duplicates(["gameid", "teamname"]).sort_values(["teamname", "date"])
-    for w in [5, 10]:
-        team_game[f"team_kill_roll{w}"] = team_game.groupby("teamname")["kills"].transform(
-            lambda s, w=w: _rolling_shift(s, w)
-        )
-    df = df.merge(
-        team_game[["gameid","teamname"] + [f"team_kill_roll{w}" for w in [5,10]]],
-        on=["gameid","teamname"], how="left"
+    df["team_kills"]   = team_kills
+    df["team_deaths"]  = team_deaths
+
+    # Kill share: what % of team kills does this player get?
+    df["kill_share"] = np.where(team_kills > 0, df["kills"] / team_kills, 0)
+
+    # Kill participation: (kills + assists) / team kills
+    df["kp_pct"] = np.where(
+        team_kills > 0,
+        (df["kills"] + df["assists"]) / team_kills,
+        0
     )
 
+    # Bloody rate: (total kills + total deaths) per minute
+    # Use both teams combined for full game pace
+    game_total_kills  = df.groupby("gameid")["kills"].transform("sum")
+    game_total_deaths = df.groupby("gameid")["deaths"].transform("sum")
+    game_len_min = df["gamelength"] / 60.0
+    df["bloody_rate"] = np.where(
+        game_len_min > 0,
+        (game_total_kills + game_total_deaths) / game_len_min,
+        0
+    )
+
+    # Post-15 kill share (kills after 15 mins / total kills)
+    # OE has killsat15 = kills up to 15 min
+    if "killsat15" in df.columns:
+        post15_kills = (df["kills"] - df["killsat15"].fillna(0)).clip(lower=0)
+        df["post15_kill_share"] = np.where(
+            team_kills > 0, post15_kills / team_kills, 0
+        )
+    else:
+        df["post15_kill_share"] = df["kill_share"]
+
+    # Damage share (already in OE)
+    if "damageshare" not in df.columns:
+        df["damageshare"] = 0.2  # default
+
+    return df
+
+
+# ── Step 2: player rolling features ───────────────────────────────────────
+
+def add_player_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-player rolling kill share and KP% features."""
+    df = df.sort_values(["playername", "position", "date"]).copy()
+
+    for stat in ["kill_share", "kp_pct", "post15_kill_share", "kills", "deaths", "assists"]:
+        if stat not in df.columns:
+            continue
+        # Winsorize first
+        w = df.groupby(["playername", "position"])[stat].transform(_winsorize)
+        # EWM rolling average
+        df[f"{stat}_player_ewm"] = df.groupby(
+            ["playername", "position"]
+        )[stat].transform(_shift_ewm)
+        # Short rolling (recent form)
+        df[f"{stat}_player_roll5"] = df.groupby(
+            ["playername", "position"]
+        )[stat].transform(lambda s: _shift_roll(s, 5))
+
+    # Win/loss split kill share
     if "result" in df.columns:
-        for w in [5, 10]:
-            team_game[f"team_winrate_roll{w}"] = team_game.groupby("teamname")["result"].transform(
-                lambda s, w=w: _rolling_shift(s, w)
+        for rv, suffix in [(1, "win"), (0, "loss")]:
+            df[f"kill_share_roll10_{suffix}"] = df.groupby(
+                ["playername", "position"]
+            )["kill_share"].transform(
+                lambda s, rv=rv: s.where(
+                    df.loc[s.index, "result"] == rv
+                ).rolling(10, min_periods=1).mean().shift(1)
             )
-        df = df.merge(
-            team_game[["gameid","teamname"] + [f"team_winrate_roll{w}" for w in [5,10]]],
-            on=["gameid","teamname"], how="left"
+        df["player_winrate"] = df.groupby(
+            ["playername", "position"]
+        )["result"].transform(lambda s: _shift_roll(s, 10))
+
+    # Games played (for shrinkage)
+    df["player_games"] = df.groupby(["playername", "position"]).cumcount()
+
+    return df
+
+
+# ── Step 3: team features ─────────────────────────────────────────────────
+
+def add_team_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Team-level pace and kill environment features."""
+    df = df.sort_values(["teamname", "date"]).copy()
+
+    # Deduplicate to one row per team per game
+    team_game = df.drop_duplicates(["gameid", "teamname"]).copy()
+    team_game = team_game.sort_values(["teamname", "date"])
+
+    for stat, col in [
+        ("team_kills",  "team_kills_ewm"),
+        ("bloody_rate", "team_bloody_rate_ewm"),
+        ("gamelength",  "team_gamelength_ewm"),
+    ]:
+        if stat not in team_game.columns:
+            continue
+        team_game[col] = team_game.groupby("teamname")[stat].transform(_shift_ewm)
+
+    if "result" in team_game.columns:
+        team_game["team_winrate"] = team_game.groupby("teamname")["result"].transform(
+            lambda s: _shift_roll(s, 10)
         )
 
-    game_len = df.drop_duplicates("gameid")[["gameid","teamname","gamelength"]].copy()
-    game_len = game_len.sort_values(["teamname","gameid"])
-    game_len["team_gamelength_roll5"] = game_len.groupby("teamname")["gamelength"].transform(
-        lambda s: _rolling_shift(s, 5)
-    )
-    df = df.merge(game_len[["gameid","teamname","team_gamelength_roll5"]],
-                  on=["gameid","teamname"], how="left")
+    merge_cols = ["gameid", "teamname"] + [
+        c for c in ["team_kills_ewm", "team_bloody_rate_ewm",
+                    "team_gamelength_ewm", "team_winrate"]
+        if c in team_game.columns
+    ]
+    df = df.merge(team_game[merge_cols], on=["gameid", "teamname"], how="left")
     return df
 
 
-def add_opponent_defensive_strength(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.sort_values(["teamname", "position", "date"]).copy()
-
-    opp_kills = df[["gameid","side","position","kills","deaths","assists"]].copy()
-    opp_kills["opp_side"] = opp_kills["side"].map({"Blue":"Red","Red":"Blue"})
-    opp_scored = opp_kills.rename(columns={
-        "kills":"opp_pos_kills_scored",
-        "deaths":"opp_pos_deaths_scored",
-        "assists":"opp_pos_assists_scored",
-        "side":"def_side",
-    })[["gameid","opp_side","position",
-        "opp_pos_kills_scored","opp_pos_deaths_scored","opp_pos_assists_scored"]]
-
-    df = df.merge(
-        opp_scored.rename(columns={"opp_side":"side"}),
-        on=["gameid","side","position"], how="left"
-    )
-
-    for stat, src in [("kills","opp_pos_kills_scored"),
-                      ("deaths","opp_pos_deaths_scored"),
-                      ("assists","opp_pos_assists_scored")]:
-        df[f"team_pos_{stat}_allowed_roll5"] = df.groupby(
-            ["teamname","position"]
-        )[src].transform(lambda s: _rolling_shift(s, 5))
-
-    weakness = df[["gameid","side","position",
-                   "team_pos_kills_allowed_roll5",
-                   "team_pos_deaths_allowed_roll5",
-                   "team_pos_assists_allowed_roll5"]].copy()
-    weakness["opp_side"] = weakness["side"].map({"Blue":"Red","Red":"Blue"})
-    weakness = weakness.rename(columns={
-        "team_pos_kills_allowed_roll5":   "opp_team_kills_allowed_roll5",
-        "team_pos_deaths_allowed_roll5":  "opp_team_deaths_allowed_roll5",
-        "team_pos_assists_allowed_roll5": "opp_team_assists_allowed_roll5",
-    })
-    df = df.merge(
-        weakness[["gameid","opp_side","position",
-                  "opp_team_kills_allowed_roll5",
-                  "opp_team_deaths_allowed_roll5",
-                  "opp_team_assists_allowed_roll5"]].rename(
-            columns={"opp_side":"side"}),
-        on=["gameid","side","position"], how="left"
-    )
-    df.drop(columns=["opp_pos_kills_scored","opp_pos_deaths_scored",
-                     "opp_pos_assists_scored"], inplace=True, errors="ignore")
-    return df
-
+# ── Step 4: opponent features ──────────────────────────────────────────────
 
 def add_opponent_features(df: pd.DataFrame) -> pd.DataFrame:
-    df["opp_side"] = df["side"].map({"Blue":"Red","Red":"Blue"})
-    opp = df[["gameid","side","position","playername",
-              "kills_player_roll5","deaths_player_roll5","assists_player_roll5"]].copy()
-    opp.columns = ["gameid","opp_side","position","opp_playername",
-                   "opp_kills_roll5","opp_deaths_roll5","opp_assists_roll5"]
-    df = df.merge(opp, on=["gameid","opp_side","position"], how="left")
-    df.drop(columns=["opp_side"], inplace=True)
+    """Opponent team defensive stats — how many kills do they give up?"""
+    df = df.sort_values(["teamname", "date"]).copy()
+
+    # Opponent team = other team in same game
+    opp_side = df["side"].map({"Blue": "Red", "Red": "Blue"})
+
+    # Get opponent team kills allowed (= kills scored against them)
+    opp_stats = df[["gameid", "side", "team_kills", "team_deaths",
+                    "bloody_rate", "team_kills_ewm"]].copy()
+    opp_stats["opp_side"] = opp_stats["side"].map({"Blue": "Red", "Red": "Blue"})
+    opp_stats = opp_stats.rename(columns={
+        "team_kills":     "opp_team_kills",
+        "team_deaths":    "opp_team_deaths",
+        "bloody_rate":    "opp_bloody_rate",
+        "team_kills_ewm": "opp_team_kills_ewm",
+    })
+
+    df = df.merge(
+        opp_stats[["gameid", "opp_side", "opp_team_kills",
+                   "opp_team_deaths", "opp_bloody_rate", "opp_team_kills_ewm"]].rename(
+            columns={"opp_side": "side"}
+        ),
+        on=["gameid", "side"], how="left"
+    )
+
+    # Opponent death rate rolling (how many kills do they give up per game?)
+    team_game = df.drop_duplicates(["gameid", "teamname"]).sort_values(["teamname", "date"])
+    team_game["opp_death_rate_ewm"] = team_game.groupby("teamname")["team_deaths"].transform(
+        _shift_ewm
+    )
+    df = df.merge(
+        team_game[["gameid", "teamname", "opp_death_rate_ewm"]],
+        on=["gameid", "teamname"], how="left"
+    )
+
     return df
 
 
-def add_momentum_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.sort_values(["playername","position","date"]).copy()
-    for stat in TARGETS:
-        short = df.groupby(["playername","position"])[stat].transform(
-            lambda s: _rolling_shift(s, 3))
-        long_ = df.groupby(["playername","position"])[stat].transform(
-            lambda s: _rolling_shift(s, 10))
-        df[f"{stat}_momentum"] = short - long_
-    if "result" in df.columns:
-        team_short = df.groupby("teamname")["result"].transform(lambda s: _rolling_shift(s, 3))
-        team_long  = df.groupby("teamname")["result"].transform(lambda s: _rolling_shift(s, 10))
-        df["team_momentum"] = team_short - team_long
-    return df
+# ── Step 5: position and side encoding ────────────────────────────────────
 
-
-def add_side_features(df: pd.DataFrame) -> pd.DataFrame:
+def add_encodings(df: pd.DataFrame) -> pd.DataFrame:
     df["is_blue_side"] = (df["side"] == "Blue").astype(int)
-    for stat in TARGETS:
-        df[f"{stat}_side_pos_avg"] = df.groupby(
-            ["position","side"]
-        )[stat].transform(_ewm_shift)
-    return df
-
-
-def add_position_encoding(df: pd.DataFrame) -> pd.DataFrame:
     pos_dummies = pd.get_dummies(df["position"], prefix="pos")
     return pd.concat([df, pos_dummies], axis=1)
 
 
-# ── Master pipeline ───────────────────────────────────────────────────────────
+# ── Master pipeline ────────────────────────────────────────────────────────
 
 def build_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
     steps = [
-        ("Player rolling stats",        add_player_rolling_features),
-        ("Champion averages",            add_champion_features),
-        ("Champion-patch interactions",  add_champion_patch_features),
-        ("Team context",                 add_team_context_features),
-        ("Opponent defensive strength",  add_opponent_defensive_strength),
-        ("Opponent features",            add_opponent_features),
-        ("Player momentum",              add_momentum_features),
-        ("Side features",                add_side_features),
-        ("Position encoding",            add_position_encoding),
+        ("Derived stats (kill share, KP%, bloody rate)", add_derived_stats),
+        ("Player rolling features",                       add_player_features),
+        ("Team pace features",                            add_team_features),
+        ("Opponent features",                             add_opponent_features),
+        ("Encodings",                                     add_encodings),
     ]
     for name, fn in steps:
         if verbose:
@@ -288,15 +233,36 @@ def build_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
     return df
 
 
-def get_feature_columns(df: pd.DataFrame) -> list[str]:
-    exclude = set(TARGETS) | {
-        "gameid","date","league","split","patch",
-        "side","position","playername","teamname",
-        "champion","ban1","ban2","ban3","ban4","ban5",
-        "result","opp_playername",
-    }
-    return [
-        c for c in df.columns
-        if c not in exclude
-        and pd.api.types.is_numeric_dtype(df[c])
+def get_team_kill_features(df: pd.DataFrame) -> list[str]:
+    """Features for Model 1 — predicting total team kills."""
+    candidates = [
+        "team_kills_ewm", "team_bloody_rate_ewm", "team_gamelength_ewm",
+        "team_winrate", "opp_team_kills_ewm", "opp_bloody_rate",
+        "opp_death_rate_ewm", "is_blue_side",
+        # early game indicators
+        "golddiffat15", "xpdiffat15",
     ]
+    return [c for c in candidates if c in df.columns]
+
+
+def get_kill_share_features(df: pd.DataFrame) -> list[str]:
+    """Features for Model 2 — predicting player kill share %."""
+    candidates = [
+        # Player kill share history
+        "kill_share_player_ewm", "kill_share_player_roll5",
+        "kp_pct_player_ewm", "kp_pct_player_roll5",
+        "post15_kill_share_player_ewm",
+        "kill_share_roll10_win", "kill_share_roll10_loss",
+        "player_winrate", "player_games",
+        # Raw kill history (winsorized via ewm)
+        "kills_player_ewm", "kills_player_roll5",
+        "deaths_player_ewm", "assists_player_ewm",
+        # Damage share
+        "damageshare",
+        # Team context
+        "team_kills_ewm", "team_winrate",
+        # Position encoding
+        "pos_top", "pos_jng", "pos_mid", "pos_bot", "pos_sup",
+        "is_blue_side",
+    ]
+    return [c for c in candidates if c in df.columns]
