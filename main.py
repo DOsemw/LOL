@@ -294,6 +294,7 @@ def predict_player(
 
     player_df, X = _get_player_row(player)
     position      = player_df.iloc[0]["position"]
+    games_played  = player_df["gameid"].nunique()
 
     if "is_blue_side" in X.columns:
         X["is_blue_side"] = 1 if side.lower() == "blue" else 0
@@ -314,6 +315,46 @@ def predict_player(
     for stat in ["kills","deaths","assists"]:
         model, _, metrics = load_model(stat)
         pg[stat] = _predict_stat(model, X, metrics["mae"])
+
+    # 2.5 Bayesian shrinkage for low-sample players
+    # If a player has few games, blend their prediction toward the
+    # league+position average for this season.
+    # Weight formula: player_weight = min(games / 20, 1.0)
+    # So at 2 games: 10% player + 90% league avg
+    # At 10 games: 50% player + 50% league avg
+    # At 20+ games: 100% player (no shrinkage)
+    games_played = player_df["gameid"].nunique()
+    if games_played < 20:
+        player_weight = games_played / 20.0
+        league        = player_df.iloc[0]["league"]
+
+        # Compute league+position average from full dataset
+        league_pos_mask = (
+            (df["position"] == position) &
+            (df["league"]   == league)
+        )
+        league_pos_df = df[league_pos_mask]
+
+        for stat in ["kills", "deaths", "assists"]:
+            if len(league_pos_df) >= 10:
+                league_avg = float(league_pos_df[stat].mean())
+            else:
+                # Fall back to position average across all leagues
+                league_avg = float(df[df["position"] == position][stat].mean())
+
+            blended = player_weight * pg[stat]["per_game"] + (1 - player_weight) * league_avg
+            # Apply same ratio to low/high to maintain spread
+            if pg[stat]["per_game"] > 0:
+                ratio = blended / pg[stat]["per_game"]
+            else:
+                ratio = 1.0
+            ratio = min(max(ratio, 0.3), 3.0)
+
+            pg[stat]["per_game"] = round(blended, 2)
+            pg[stat]["low"]      = round(pg[stat]["low"]  * ratio, 2)
+            pg[stat]["high"]     = round(pg[stat]["high"] * ratio, 2)
+            pg[stat]["shrinkage_weight"] = round(player_weight, 2)
+            pg[stat]["league_avg"]       = round(league_avg, 2)
 
     # 3. Scale predictions using data-driven win/loss calibration
     # This replaces hand-crafted multipliers with empirical ratios from actual data
@@ -369,6 +410,7 @@ def predict_player(
         "m1_2": _build_series(pg, exp_bo2, win_prob),
         "m1_3": _build_series(pg, exp_bo3, win_prob),
 
+        "games_in_sample": int(mask.sum()),
         "recent_form": recent.to_dict(orient="records"),
     }
 
